@@ -1,23 +1,108 @@
+//! Commandline tool to interact with WebDAV servers.
+#![allow(clippy::needless_pass_by_value)]
 use std::collections::HashMap;
 use std::env;
-use std::fmt::Write;
+use std::fmt::Write as _;
+use std::io::stdout;
 use std::num::ParseIntError;
+use std::path::PathBuf;
 use std::str::FromStr;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use comfy_table::presets::{NOTHING, UTF8_FULL_CONDENSED};
 use comfy_table::{ContentArrangement, Table};
 use derive_more::derive::{Display, FromStr};
 use humansize::DECIMAL;
 use percent_encoding::percent_decode;
-use reqwest_dav::re_exports::reqwest::Method;
-use reqwest_dav::re_exports::{reqwest, tokio};
-use reqwest_dav::{Auth, Client, Depth};
 use time::OffsetDateTime;
 use time::format_description::well_known::{Rfc2822, Rfc3339};
-use url::Url;
-use webdav_client::webdav_types::{MultiStatus, PropValue, Response};
+use webdav_client::webdav_types::{PropValue, Response};
+use webdav_client::{Auth, Depth};
+
+#[derive(Clone, Debug)]
+struct Client {
+    inner: webdav_client::Client<reqwest::blocking::Client>,
+    host: String,
+}
+
+impl Client {
+    fn new(host: String, login: Option<String>, password: Option<Password>) -> Self {
+        let auth = if login.is_some() {
+            Auth::Basic {
+                username: login.unwrap_or_default(),
+                password: password.map(|p| p.0),
+            }
+        } else {
+            Auth::None
+        };
+
+        Self {
+            inner: webdav_client::Client::authenticated(reqwest::blocking::Client::new(), auth),
+            host,
+        }
+    }
+
+    fn path(&self, path: &str) -> String {
+        self.host.clone()
+            + if self.host.ends_with('/') && path.starts_with('/') {
+                &path[1..]
+            } else {
+                path
+            }
+    }
+
+    fn list(&self, path: &str, depth: Depth, fields: &[ListField]) -> Result<()> {
+        let mut namespaces = HashMap::new();
+        let names = fields
+            .iter()
+            .flat_map(|field| field.to_xml(&mut namespaces))
+            .collect::<Result<Vec<String>>>()?;
+        let namespaces: Vec<_> = namespaces
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .chain([
+                ("d", "DAV:"),
+                ("oc", "http://owncloud.org/ns"),
+                ("nc", "http://nextcloud.org/ns"),
+            ])
+            .collect();
+        let url = self.path(path);
+        let xml = self.inner.prop_find(&url, depth, &names, namespaces)?;
+
+        let mut table = Table::new();
+        if table.is_tty() {
+            table.load_preset(UTF8_FULL_CONDENSED);
+            table.set_content_arrangement(ContentArrangement::Dynamic);
+        } else {
+            table.load_preset(NOTHING);
+        }
+        table.set_header(fields);
+        for line in xml {
+            table.add_row(
+                fields
+                    .iter()
+                    .map(|field| field.extract(&line, &url).unwrap_or_default()),
+            );
+        }
+
+        println!("{table}");
+        Ok(())
+    }
+
+    fn get(&self, path: String, out_path: Option<PathBuf>) -> Result<()> {
+        let mut result = self.inner.get_raw(self.path(&path))?;
+        if let Some(out_path) = out_path {
+            result.copy_to(
+                &mut std::fs::File::create_new(&out_path)
+                    .with_context(|| format!("Could not create `{}`", out_path.display()))?,
+            )?;
+        } else {
+            result.copy_to(&mut stdout())?;
+        }
+        Ok(())
+    }
+}
 
 fn replace_env(mut help: String) -> String {
     fn shorten(s: String) -> String {
@@ -48,8 +133,7 @@ fn replace_env(mut help: String) -> String {
     help
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let command = Args::command_for_update().mut_args(|mut a| {
         if let Some(help) = a.get_help().map(|s| s.ansi().to_string()) {
             a = a.help(replace_env(help.to_string()));
@@ -66,21 +150,10 @@ async fn main() -> Result<()> {
         action,
     } = Args::from_arg_matches(&command.get_matches())?;
 
-    let auth = if login.is_some() || password.is_some() {
-        Auth::Basic(login.unwrap_or_default(), password.unwrap_or_default().0)
-    } else {
-        Auth::Anonymous
-    };
-
-    let client = Client {
-        agent: reqwest::Client::new(),
-        host: host.to_string(),
-        auth,
-        digest_auth: Default::default(),
-    };
+    let client = Client::new(host, login, password);
 
     match action {
-        Action::Get => todo!(),
+        Action::Get { path, out_path } => client.get(path, out_path)?,
         Action::Put => todo!(),
         Action::Delete => todo!(),
         Action::Mkcol => todo!(),
@@ -93,79 +166,14 @@ async fn main() -> Result<()> {
             extra_fields,
         } => {
             fields.extend_from_slice(&extra_fields);
-            list(client, path, depth, fields).await?;
+            client.list(&path, depth, &fields)?;
         }
     }
-    Ok(())
-}
-
-pub async fn list(
-    client: Client,
-    path: Option<String>,
-    depth: Depth,
-    fields: Vec<ListField>,
-) -> Result<()> {
-    let mut namespaces = HashMap::new();
-    let names = fields
-        .iter()
-        .flat_map(|field| field.to_xml(&mut namespaces))
-        .collect::<Result<Vec<String>>>()?;
-    let body = format_xml::format! {
-        <?xml version="1.0"?>
-        <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
-          <d:prop>
-            for name in &names {
-                |f| write!(f, "<{name}/>").unwrap();
-            }
-          </d:prop>
-        </d:propfind>
-    };
-    let response = client
-        .start_request(
-            Method::from_str("PROPFIND")?,
-            path.as_deref().unwrap_or_default(),
-        )
-        .await?
-        .header("depth", match depth {
-            Depth::Number(n) => format!("{n}"),
-            Depth::Infinity => "infinity".to_owned(),
-        })
-        .body(body)
-        .send()
-        .await?;
-    let xml = response.text().await?;
-    let xml: MultiStatus = quick_xml::de::from_str(&xml)?;
-
-    let mut prefix_path = client.host.clone();
-    if let Some(path) = path {
-        if !prefix_path.ends_with('/') {
-            prefix_path += "/";
-        }
-        prefix_path += path.strip_prefix('/').unwrap_or(path.as_str());
-    }
-
-    let mut table = Table::new();
-    if table.is_tty() {
-        table.load_preset(UTF8_FULL_CONDENSED);
-        table.set_content_arrangement(ContentArrangement::Dynamic);
-    } else {
-        table.load_preset(NOTHING);
-    }
-    table.set_header(&fields);
-    for line in xml {
-        table.add_row(
-            fields
-                .iter()
-                .map(|field| field.extract(&line, &prefix_path).unwrap_or_default()),
-        );
-    }
-
-    println!("{table}");
     Ok(())
 }
 
 #[derive(Clone, FromStr, Default)]
-pub struct Password(pub String);
+struct Password(String);
 
 impl std::fmt::Debug for Password {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -173,7 +181,6 @@ impl std::fmt::Debug for Password {
     }
 }
 
-#[allow(clippy::doc_markdown)]
 /// Utility to interact with WebDAV servers.
 #[derive(Parser, Debug)]
 struct Args {
@@ -185,14 +192,19 @@ struct Args {
     password: Option<Password>,
     /// WebDAV server to use [env HOST={HOST}]
     #[arg(short = 's', long, env, hide_env = true)]
-    host: Url,
+    host: String,
     #[clap(subcommand)]
     action: Action,
 }
 
 #[derive(Subcommand, Debug)]
 enum Action {
-    Get,
+    Get {
+        #[clap(default_value = "/")]
+        path: String,
+        #[clap(long, short)]
+        out_path: Option<PathBuf>,
+    },
     Put,
     Delete,
     #[clap(alias = "mkdir")]
@@ -201,8 +213,8 @@ enum Action {
     Copy,
     /// List files and their properties.
     List {
-        // #[arg(short, long, positional = true)]
-        path: Option<String>,
+        #[clap(default_value = "/")]
+        path: String,
         #[clap(long, short, value_parser = parse_depth, default_value = "1")]
         depth: Depth,
         /// The fields to request and show for each entry.
@@ -260,7 +272,7 @@ enum Action {
 /// E.g. for Nextcloud: <https://docs.nextcloud.com/server/latest/developer_manual/client_apis/WebDAV/basic.html#supported-properties>
 #[derive(ValueEnum, Clone, Debug, Display)]
 #[display(rename_all = "kebab-case")]
-pub enum ListField {
+enum ListField {
     AbsolutePath,
     Path,
     /// `d:displayname`
@@ -516,6 +528,6 @@ fn parse_depth(value: &str) -> Result<Depth, ParseIntError> {
     if value.len() >= 3 && "infinity".starts_with(&value.to_lowercase()) {
         Ok(Depth::Infinity)
     } else {
-        Ok(Depth::Number(value.parse()?))
+        Ok(Depth::Some(value.parse()?))
     }
 }

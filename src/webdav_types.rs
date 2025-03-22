@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+//! Types to parse WebDAV responses.
 use core::fmt;
 use std::collections::HashMap;
 
