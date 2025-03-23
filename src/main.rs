@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
-use std::io::stdout;
+use std::io::{stdin, stdout};
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -15,10 +15,11 @@ use comfy_table::{ContentArrangement, Table};
 use derive_more::derive::{Display, FromStr};
 use humansize::DECIMAL;
 use percent_encoding::percent_decode;
+use reqwest::blocking::Body;
 use time::OffsetDateTime;
 use time::format_description::well_known::{Rfc2822, Rfc3339};
 use webdav_client::webdav_types::{PropValue, Response};
-use webdav_client::{Auth, Depth};
+use webdav_client::{Auth, Depth, Request};
 
 #[derive(Clone, Debug)]
 struct Client {
@@ -68,7 +69,14 @@ impl Client {
             ])
             .collect();
         let url = self.path(path);
-        let xml = self.inner.prop_find(&url, depth, &names, namespaces)?;
+        let xml = self.inner.prop_find(&url, depth, &names, namespaces);
+        if let Err(e) = xml {
+            if e.is_404() {
+                bail!("404 Does not exist {}", self.path(path))
+            }
+            bail!(e)
+        };
+        let xml = xml?;
 
         let mut table = Table::new();
         if table.is_tty() {
@@ -91,15 +99,41 @@ impl Client {
     }
 
     fn get(&self, path: String, out_path: Option<PathBuf>) -> Result<()> {
-        let mut result = self.inner.get_raw(self.path(&path))?;
-        if let Some(out_path) = out_path {
-            result.copy_to(
-                &mut std::fs::File::create_new(&out_path)
-                    .with_context(|| format!("Could not create `{}`", out_path.display()))?,
-            )?;
-        } else {
-            result.copy_to(&mut stdout())?;
+        let result = self.inner.get_raw(self.path(&path));
+        match result {
+            Ok(mut result) => {
+                if let Some(out_path) = out_path {
+                    result.copy_to(
+                        &mut std::fs::File::create_new(&out_path).with_context(|| {
+                            format!("Could not create `{}`", out_path.display())
+                        })?,
+                    )?;
+                } else {
+                    result.copy_to(&mut stdout())?;
+                }
+                Ok(())
+            }
+            Err(e) if e.is_404() => bail!("404 Does not exist {}", self.path(&path)),
+            other => {
+                other?;
+                Ok(())
+            }
         }
+    }
+
+    fn put(&self, path: String, in_path: Option<PathBuf>) -> Result<()> {
+        let request = self.inner.put_raw(self.path(&path));
+        Request::send(
+            if let Some(in_path) = in_path {
+                request.body(
+                    std::fs::File::open(&in_path)
+                        .with_context(|| format!("Could not read `{}`", in_path.display()))?,
+                )
+            } else {
+                request.body(Body::new(stdin()))
+            },
+            None,
+        )?;
         Ok(())
     }
 }
@@ -154,7 +188,7 @@ fn main() -> Result<()> {
 
     match action {
         Action::Get { path, out_path } => client.get(path, out_path)?,
-        Action::Put => todo!(),
+        Action::Put { path, in_path } => client.put(path, in_path)?,
         Action::Delete => todo!(),
         Action::Mkcol => todo!(),
         Action::Move => todo!(),
@@ -205,7 +239,12 @@ enum Action {
         #[clap(long, short)]
         out_path: Option<PathBuf>,
     },
-    Put,
+    Put {
+        #[clap(default_value = "/")]
+        path: String,
+        #[clap(long, short)]
+        in_path: Option<PathBuf>,
+    },
     Delete,
     #[clap(alias = "mkdir")]
     Mkcol,

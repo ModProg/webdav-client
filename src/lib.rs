@@ -44,11 +44,19 @@ pub enum Error {
     WebRequest(Box<dyn std::error::Error + Send + Sync>),
     /// Error caused in parsing the response.
     Parsing(quick_xml::DeError),
+    #[display("Non 200 status code {status} {}", text.as_deref().unwrap_or_default())]
+    ErrorStatus { status: u16, text: Option<String> },
 }
 
 impl Error {
-    fn web_request(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+    #[must_use]
+    pub fn web_request(source: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::WebRequest(Box::new(source))
+    }
+
+    #[must_use]
+    pub fn is_404(&self) -> bool {
+        matches!(self, Self::ErrorStatus { status: 404, .. })
     }
 }
 
@@ -119,7 +127,7 @@ impl<T: WebClient<Asyncness = A>, A: Asyncness> Client<T> {
                 Depth::Some(n) => n.to_string().into_bytes(),
                 Depth::Infinity => b"infinity".to_vec(),
             })
-            .send(Some(body.into_bytes()));
+            .send_ok(Some(body.into_bytes()));
         let response = A::flat_and_then(response, Response::text);
         A::and_then(response, |s| {
             quick_xml::de::from_str(&s).map_err(Error::Parsing)
@@ -127,16 +135,18 @@ impl<T: WebClient<Asyncness = A>, A: Asyncness> Client<T> {
     }
 
     pub fn get(&self, url: impl AsRef<str>) -> A::Future<Result<Vec<u8>>> {
-        #[allow(clippy::redundant_closure_for_method_calls)]
-        A::flat_and_then(self.get_raw(url), |r| r.bytes())
+        A::flat_and_then(self.get_raw(url), web_client::Response::bytes)
     }
 
     pub fn get_raw(&self, url: impl AsRef<str>) -> A::Future<Result<T::Response>> {
-        #[allow(clippy::redundant_closure_for_method_calls)]
-        self.request("GET", url.as_ref()).send(None)
+        self.request("GET", url.as_ref()).send_ok(None)
     }
 
     // pub fn put(&self, url: impl AsRef<str>, data: Vec<u8>) -> <T::Request as
     // Request>::Result<()> {     self.request("GET", url.as_ref()).send(None);
     // }
+
+    pub fn put_raw(&self, url: impl AsRef<str>) -> T::Request {
+        self.request("PUT", url.as_ref())
+    }
 }

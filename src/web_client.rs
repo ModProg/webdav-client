@@ -1,11 +1,22 @@
+use std::future::ready;
 use std::str::FromStr;
 
+#[cfg(all(feature = "batteries", feature = "attohttpc"))]
+pub use attohttpc;
+#[cfg(feature = "async")]
 use futures_util::{FutureExt, TryFutureExt};
+#[cfg(all(feature = "batteries", feature = "minreq"))]
+pub use minreq;
+#[cfg(all(feature = "batteries", feature = "reqwest"))]
+pub use reqwest;
+#[cfg(all(feature = "batteries", feature = "ureq"))]
+pub use ureq;
 
 use super::*;
 
 pub trait Asyncness {
     type Future<T: 'static>;
+    fn ready<T: Send>(value: T) -> Self::Future<T>;
     fn map<T, O>(value: Self::Future<T>, fun: impl Transformer<T, O>) -> Self::Future<O>;
     fn flat_map<T, O>(
         value: Self::Future<T>,
@@ -29,7 +40,7 @@ pub trait WebClient {
     fn request(&self, method: &str, url: &str) -> Self::Request;
 }
 
-pub trait Request {
+pub trait Request: Sized {
     // type Future<Output>;
     #[rustfmt::skip]
     /// Result of web client operations, should be either
@@ -44,9 +55,16 @@ pub trait Request {
         self,
         body: Option<Vec<u8>>,
     ) -> <Self::Asyncness as Asyncness>::Future<Result<Self::Response>>;
+    #[must_use]
+    fn send_ok(
+        self,
+        body: Option<Vec<u8>>,
+    ) -> <Self::Asyncness as Asyncness>::Future<Result<Self::Response>> {
+        Self::Asyncness::flat_and_then(self.send(body), Response::error_on_status_code)
+    }
 }
 
-pub trait Response: Sized {
+pub trait Response: Sized + Send {
     type Asyncness: Asyncness;
     // fn map_text<T, Fun>(self, fun: Fun) -> <Self::Asyncness as
     // Asyncness>::Future<Result<T>> where
@@ -57,6 +75,20 @@ pub trait Response: Sized {
         <Self::Asyncness>::map(self.bytes(), |b| {
             String::from_utf8(b?).map_err(Error::web_request)
         })
+    }
+    fn status(&self) -> u16;
+    fn error_on_status_code(self) -> <Self::Asyncness as Asyncness>::Future<Result<Self>> {
+        let status = self.status();
+        if (200..300).contains(&status) {
+            <Self::Asyncness>::ready(Ok(self))
+        } else {
+            Self::Asyncness::map(self.text(), move |text| {
+                Err(Error::ErrorStatus {
+                    status,
+                    text: text.ok(),
+                })
+            })
+        }
     }
 }
 
@@ -84,10 +116,17 @@ impl<T: WebClient> WebClient for super::Client<T> {
     }
 }
 
+#[cfg(feature = "async")]
 type BoxFuture<T> = futures_util::future::BoxFuture<'static, T>;
+#[cfg(feature = "async")]
 pub struct Async;
+#[cfg(feature = "async")]
 impl Asyncness for Async {
     type Future<T: 'static> = BoxFuture<T>;
+
+    fn ready<T: Send + 'static>(value: T) -> Self::Future<T> {
+        ready(value).boxed()
+    }
 
     fn map<T: 'static, O: 'static>(
         value: Self::Future<T>,
@@ -121,37 +160,35 @@ pub struct Blocking;
 impl Asyncness for Blocking {
     type Future<T: 'static> = T;
 
-    fn map<T: 'static, O: 'static>(
-        value: Self::Future<T>,
-        fun: impl Transformer<T, Self::Future<O>>,
-    ) -> Self::Future<O> {
+    fn ready<T: Send>(value: T) -> T {
+        value
+    }
+
+    fn map<T: 'static, O: 'static>(value: T, fun: impl Transformer<T, O>) -> O {
         fun(value)
     }
 
-    fn flat_map<T: 'static, O: 'static>(
-        value: Self::Future<T>,
-        fun: impl Transformer<T, Self::Future<O>>,
-    ) -> Self::Future<O> {
+    fn flat_map<T: 'static, O: 'static>(value: T, fun: impl Transformer<T, O>) -> O {
         fun(value)
     }
 
     fn and_then<T: 'static, O: 'static>(
-        value: Self::Future<Result<T>>,
+        value: Result<T>,
         fun: impl Transformer<T, Result<O>>,
-    ) -> Self::Future<Result<O>> {
+    ) -> Result<O> {
         value.and_then(fun)
     }
 
     fn flat_and_then<T: 'static, O: 'static>(
-        value: Self::Future<Result<T>>,
-        fun: impl Transformer<T, Self::Future<Result<O>>>,
-    ) -> Self::Future<Result<O>> {
+        value: Result<T>,
+        fun: impl Transformer<T, Result<O>>,
+    ) -> Result<O> {
         value.and_then(fun)
     }
 }
 
-// #[cfg(nothing)]
-mod reqwest {
+#[cfg(feature = "reqwest")]
+mod reqwest_impl {
 
     use futures_util::{FutureExt, TryFutureExt};
     use reqwest::{Client, RequestBuilder, Response};
@@ -204,10 +241,15 @@ mod reqwest {
                 .map_err(Error::web_request)
                 .boxed()
         }
+
+        fn status(&self) -> u16 {
+            self.status().as_u16()
+        }
     }
 }
 
-mod reqwest_blocking {
+#[cfg(feature = "reqwest-blocking")]
+mod reqwest_blocking_impl {
 
     use reqwest::blocking::{Client, RequestBuilder, Response};
 
@@ -248,10 +290,15 @@ mod reqwest_blocking {
         fn bytes(self) -> Result<Vec<u8>> {
             self.bytes().map(|b| b.to_vec()).map_err(Error::web_request)
         }
+
+        fn status(&self) -> u16 {
+            self.status().as_u16()
+        }
     }
 }
 
-mod ureq {
+#[cfg(feature = "ureq")]
+mod ureq_impl {
     use http::response::Response;
     use ureq::Body;
 
@@ -307,12 +354,18 @@ mod ureq {
         fn bytes(self) -> <Self::Asyncness as super::Asyncness>::Future<Result<Vec<u8>>> {
             self.into_body().read_to_vec().map_err(Error::web_request)
         }
+
+        fn status(&self) -> u16 {
+            self.status().as_u16()
+        }
     }
 }
 
-pub use minreq::Minreq;
-mod minreq {
-    use ::minreq::{Request, Response};
+#[cfg(feature = "minreq")]
+pub use minreq_impl::Minreq;
+#[cfg(feature = "minreq")]
+mod minreq_impl {
+    use minreq::{Request, Response};
 
     use super::{Blocking, Error, Result, WebClient, minreq, str};
     pub struct Minreq;
@@ -353,6 +406,64 @@ mod minreq {
 
         fn bytes(self) -> Result<Vec<u8>> {
             Ok(self.into_bytes())
+        }
+
+        fn status(&self) -> u16 {
+            use intentional::CastInto;
+            self.status_code.cast_into()
+        }
+    }
+}
+#[cfg(feature = "attohttpc")]
+pub use attohttpc_impl::Attohttpc;
+#[cfg(feature = "attohttpc")]
+mod attohttpc_impl {
+    use attohttpc::body::Bytes;
+    use attohttpc::{RequestBuilder, Response};
+    use http::Method;
+    use intentional::Assert;
+
+    /// Marker struct used until <https://github.com/sbstp/attohttpc/issues/188> is resolved.
+    pub struct Attohttpc;
+
+    use super::{Blocking, Error, Result, WebClient, str};
+    impl WebClient for Attohttpc {
+        type Asyncness = Blocking;
+        type Request = RequestBuilder;
+        type Response = Response;
+
+        fn request(&self, method: &str, url: &str) -> RequestBuilder {
+            RequestBuilder::new(Method::from_bytes(method.as_bytes()).assert_expected(), url)
+        }
+    }
+
+    impl super::Request for RequestBuilder {
+        type Asyncness = Blocking;
+        type Response = Response;
+
+        fn header(self, key: &[u8], value: Vec<u8>) -> Self {
+            self.header(http::HeaderName::from_bytes(key).assert_expected(), value)
+        }
+
+        fn send(self, body: Option<Vec<u8>>) -> Result<Response> {
+            if let Some(body) = body {
+                self.body(Bytes(body)).send()
+            } else {
+                self.send()
+            }
+            .map_err(Error::web_request)
+        }
+    }
+
+    impl super::Response for Response {
+        type Asyncness = Blocking;
+
+        fn bytes(self) -> Result<Vec<u8>> {
+            self.bytes().map_err(Error::web_request)
+        }
+
+        fn status(&self) -> u16 {
+            self.status().as_u16()
         }
     }
 }
