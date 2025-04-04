@@ -91,11 +91,11 @@ required-features = ["attohttpc"]
 
 [[example]]
 name = "reqwest_async"
-required-features = ["reqwest_async"]
+required-features = ["reqwest"]
 
 [[example]]
 name = "reqwest_blocking"
-required-features = ["reqwest_blocking"]
+required-features = ["reqwest-blocking"]
 
 [[example]]
 name = "ureq"
