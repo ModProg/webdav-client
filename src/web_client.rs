@@ -347,7 +347,7 @@ pub use minreq_impl::Minreq;
 mod minreq_impl {
     use minreq::{Request, Response};
 
-    use super::{Blocking, Error, Result, WebClient, minreq, str};
+    use super::{Blocking, Error, Result, WebClient, str};
     pub struct Minreq;
     impl WebClient for Minreq {
         type Asyncness = Blocking;
