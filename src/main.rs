@@ -6,12 +6,14 @@ use std::fmt::Write as _;
 use std::io::{stdin, stdout};
 use std::num::ParseIntError;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::str::FromStr;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Error, Result, anyhow, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use comfy_table::presets::{NOTHING, UTF8_FULL_CONDENSED};
 use comfy_table::{ContentArrangement, Table};
+use derive_more::Error;
 use derive_more::derive::{Display, FromStr};
 use humansize::DECIMAL;
 use percent_encoding::percent_decode;
@@ -20,6 +22,16 @@ use time::OffsetDateTime;
 use time::format_description::well_known::{Rfc2822, Rfc3339};
 use webdav_client::webdav_types::{PropValue, Response};
 use webdav_client::{Auth, Depth, Request};
+
+#[derive(Debug, Error, Display)]
+#[display("{_0}")]
+struct ExitCodeError(u8, Error);
+
+impl From<Error> for ExitCodeError {
+    fn from(value: Error) -> Self {
+        Self(1, value)
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Client {
@@ -45,12 +57,13 @@ impl Client {
     }
 
     fn path(&self, path: &str) -> String {
-        self.host.clone()
-            + if self.host.ends_with('/') && path.starts_with('/') {
-                &path[1..]
-            } else {
-                path
-            }
+        if self.host.ends_with('/') && path.starts_with('/') {
+            self.host.clone() + path.trim_start_matches('/')
+        } else if self.host.ends_with('/') || path.starts_with('/') {
+            self.host.clone() + path
+        } else {
+            self.host.clone() + "/" + path
+        }
     }
 
     fn list(&self, path: &str, depth: Depth, fields: &[ListField]) -> Result<()> {
@@ -71,8 +84,11 @@ impl Client {
         let url = self.path(path);
         let xml = self.inner.prop_find(&url, depth, &names, namespaces);
         if let Err(e) = xml {
-            if e.is_404() {
-                bail!("404 Does not exist {}", self.path(path))
+            if e.is_not_found() {
+                bail!(ExitCodeError(
+                    44,
+                    anyhow!("404 Does not exist {}", self.path(path))
+                ))
             }
             bail!(e)
         };
@@ -103,17 +119,15 @@ impl Client {
         match result {
             Ok(mut result) => {
                 if let Some(out_path) = out_path {
-                    result.copy_to(
-                        &mut std::fs::File::create_new(&out_path).with_context(|| {
-                            format!("Could not create `{}`", out_path.display())
-                        })?,
-                    )?;
+                    result.copy_to(&mut std::fs::File::create_new(&out_path).with_context(
+                        || format!("Could not create file for output `{}`", out_path.display()),
+                    )?)?;
                 } else {
                     result.copy_to(&mut stdout())?;
                 }
                 Ok(())
             }
-            Err(e) if e.is_404() => bail!("404 Does not exist {}", self.path(&path)),
+            Err(e) if e.is_not_found() => bail!("404 Not Found {}", self.path(&path)),
             other => {
                 other?;
                 Ok(())
@@ -123,17 +137,30 @@ impl Client {
 
     fn put(&self, path: String, in_path: Option<PathBuf>) -> Result<()> {
         let request = self.inner.put_raw(self.path(&path));
-        Request::send(
+        if let Err(e) = Request::send_ok(
             if let Some(in_path) = in_path {
-                request.body(
-                    std::fs::File::open(&in_path)
-                        .with_context(|| format!("Could not read `{}`", in_path.display()))?,
-                )
+                request.body(std::fs::File::open(&in_path).with_context(|| {
+                    format!("Could not read input file `{}`", in_path.display())
+                })?)
             } else {
                 request.body(Body::new(stdin()))
             },
             None,
-        )?;
+        ) {
+            if e.is_conflict() {
+                bail!("409 Conflict (probably a directory) {}", self.path(&path))
+            }
+            if e.is_not_found() {
+                bail!(ExitCodeError(
+                    44,
+                    anyhow!(
+                        "404 Not Found (probably parent directory non-existent) {}",
+                        self.path(&path)
+                    )
+                ))
+            }
+            bail!(e)
+        };
         Ok(())
     }
 }
@@ -167,7 +194,7 @@ fn replace_env(mut help: String) -> String {
     help
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let command = Args::command_for_update().mut_args(|mut a| {
         if let Some(help) = a.get_help().map(|s| s.ansi().to_string()) {
             a = a.help(replace_env(help.to_string()));
@@ -186,9 +213,9 @@ fn main() -> Result<()> {
 
     let client = Client::new(host, login, password);
 
-    match action {
-        Action::Get { path, out_path } => client.get(path, out_path)?,
-        Action::Put { path, in_path } => client.put(path, in_path)?,
+    if let Err(e) = match action {
+        Action::Get { path, out_path } => client.get(path, out_path),
+        Action::Put { path, in_path } => client.put(path, in_path),
         Action::Delete => todo!(),
         Action::Mkcol => todo!(),
         Action::Move => todo!(),
@@ -200,10 +227,15 @@ fn main() -> Result<()> {
             extra_fields,
         } => {
             fields.extend_from_slice(&extra_fields);
-            client.list(&path, depth, &fields)?;
+            client.list(&path, depth, &fields)
         }
+    } {
+        let ExitCodeError(code, error) = e.downcast::<ExitCodeError>()?;
+        eprintln!("{error:?}");
+        Ok(code.into())
+    } else {
+        Ok(ExitCode::SUCCESS)
     }
-    Ok(())
 }
 
 #[derive(Clone, FromStr, Default)]

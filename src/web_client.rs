@@ -17,18 +17,21 @@ use super::*;
 pub trait Asyncness {
     type Future<T: 'static>;
     fn ready<T: Send>(value: T) -> Self::Future<T>;
-    fn map<T, O>(value: Self::Future<T>, fun: impl Transformer<T, O>) -> Self::Future<O>;
+    fn map<T, O>(
+        value: Self::Future<T>,
+        fun: impl FnOnce(T) -> O + Send + 'static,
+    ) -> Self::Future<O>;
     fn flat_map<T, O>(
         value: Self::Future<T>,
-        fun: impl Transformer<T, Self::Future<O>>,
+        fun: impl FnOnce(T) -> Self::Future<O> + Send + 'static,
     ) -> Self::Future<O>;
     fn and_then<T, O>(
         value: Self::Future<Result<T>>,
-        fun: impl Transformer<T, Result<O>>,
+        fun: impl FnOnce(T) -> Result<O> + Send + 'static,
     ) -> Self::Future<Result<O>>;
     fn flat_and_then<T, O>(
         value: Self::Future<Result<T>>,
-        fun: impl Transformer<T, Self::Future<Result<O>>>,
+        fun: impl FnOnce(T) -> Self::Future<Result<O>> + Send + 'static,
     ) -> Self::Future<Result<O>>;
 }
 
@@ -41,16 +44,12 @@ pub trait WebClient {
 }
 
 pub trait Request: Sized {
-    // type Future<Output>;
-    #[rustfmt::skip]
-    /// Result of web client operations, should be either
-    /// <code>[Pin]<[Box]<dyn [Future]<Output = [Result]<[MultiStatus]>>>></code>
-    /// or <code>[Result]<[MultiStatus]></code>.
     type Asyncness: Asyncness;
     type Response: Response<Asyncness = Self::Asyncness>;
     #[must_use]
     fn header(self, key: &[u8], value: Vec<u8>) -> Self;
     #[must_use]
+    #[deprecated = "probably use `send_ok` unless you handle HTTP status codes"]
     fn send(
         self,
         body: Option<Vec<u8>>,
@@ -60,15 +59,13 @@ pub trait Request: Sized {
         self,
         body: Option<Vec<u8>>,
     ) -> <Self::Asyncness as Asyncness>::Future<Result<Self::Response>> {
+        #![allow(deprecated)]
         Self::Asyncness::flat_and_then(self.send(body), Response::error_on_status_code)
     }
 }
 
 pub trait Response: Sized + Send {
     type Asyncness: Asyncness;
-    // fn map_text<T, Fun>(self, fun: Fun) -> <Self::Asyncness as
-    // Asyncness>::Future<Result<T>> where
-    //     for<'a> Fun: Transformer<&'a str, Result<T>>;
 
     fn bytes(self) -> <Self::Asyncness as Asyncness>::Future<Result<Vec<u8>>>;
     fn text(self) -> <Self::Asyncness as Asyncness>::Future<Result<String>> {
@@ -90,14 +87,6 @@ pub trait Response: Sized + Send {
             })
         }
     }
-}
-
-// "trait alias"
-pub trait Transformer<From, To>: Send + Sync + 'static + FnOnce(From) -> To {}
-
-impl<Function, From, To> Transformer<From, To> for Function where
-    Function: Send + Sync + 'static + FnOnce(From) -> To
-{
 }
 
 impl<T: WebClient> WebClient for super::Client<T> {
@@ -130,32 +119,33 @@ impl Asyncness for Async {
 
     fn map<T: 'static, O: 'static>(
         value: Self::Future<T>,
-        fun: impl Transformer<T, O>,
+        fun: impl FnOnce(T) -> O + Send + 'static,
     ) -> Self::Future<O> {
         value.map(fun).boxed()
     }
 
     fn flat_map<T: 'static, O: 'static>(
         value: Self::Future<T>,
-        fun: impl Transformer<T, Self::Future<O>>,
+        fun: impl FnOnce(T) -> Self::Future<O> + Send + 'static,
     ) -> Self::Future<O> {
         value.map(fun).flatten().boxed()
     }
 
     fn and_then<T: 'static, O: 'static>(
         value: Self::Future<Result<T>>,
-        fun: impl Transformer<T, Result<O>>,
+        fun: impl FnOnce(T) -> Result<O> + Send + 'static,
     ) -> Self::Future<Result<O>> {
         value.map(|r| r.and_then(fun)).boxed()
     }
 
     fn flat_and_then<T: 'static, O: 'static>(
         value: Self::Future<Result<T>>,
-        fun: impl Transformer<T, Self::Future<Result<O>>>,
+        fun: impl FnOnce(T) -> Self::Future<Result<O>> + Send + 'static,
     ) -> Self::Future<Result<O>> {
         value.and_then(fun).boxed()
     }
 }
+
 pub struct Blocking;
 impl Asyncness for Blocking {
     type Future<T: 'static> = T;
@@ -164,25 +154,19 @@ impl Asyncness for Blocking {
         value
     }
 
-    fn map<T: 'static, O: 'static>(value: T, fun: impl Transformer<T, O>) -> O {
+    fn map<T, O>(value: T, fun: impl FnOnce(T) -> O) -> O {
         fun(value)
     }
 
-    fn flat_map<T: 'static, O: 'static>(value: T, fun: impl Transformer<T, O>) -> O {
+    fn flat_map<T, O>(value: T, fun: impl FnOnce(T) -> O) -> O {
         fun(value)
     }
 
-    fn and_then<T: 'static, O: 'static>(
-        value: Result<T>,
-        fun: impl Transformer<T, Result<O>>,
-    ) -> Result<O> {
+    fn and_then<T, O>(value: Result<T>, fun: impl FnOnce(T) -> Result<O>) -> Result<O> {
         value.and_then(fun)
     }
 
-    fn flat_and_then<T: 'static, O: 'static>(
-        value: Result<T>,
-        fun: impl Transformer<T, Result<O>>,
-    ) -> Result<O> {
+    fn flat_and_then<T, O>(value: Result<T>, fun: impl FnOnce(T) -> Result<O>) -> Result<O> {
         value.and_then(fun)
     }
 }
@@ -227,13 +211,6 @@ mod reqwest_impl {
 
     impl super::Response for Response {
         type Asyncness = Async;
-
-        // fn map_text<T, Fun>(self, fun: Fun) -> BoxFuture<Result<T>>
-        // where
-        //     for<'a> Fun: Transformer<&'a str, Result<T>>,
-        // {
-        //     async move { fun(&self.text().await.map_err(Error::web_request)?)
-        // }.boxed() }
 
         fn bytes(self) -> BoxFuture<Result<Vec<u8>>> {
             self.bytes()
@@ -414,6 +391,7 @@ mod minreq_impl {
         }
     }
 }
+
 #[cfg(feature = "attohttpc")]
 pub use attohttpc_impl::Attohttpc;
 #[cfg(feature = "attohttpc")]

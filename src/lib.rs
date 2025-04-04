@@ -44,7 +44,7 @@ pub enum Error {
     WebRequest(Box<dyn std::error::Error + Send + Sync>),
     /// Error caused in parsing the response.
     Parsing(quick_xml::DeError),
-    #[display("Non 200 status code {status} {}", text.as_deref().unwrap_or_default())]
+    #[display("Non 2xx status code {status} {}", text.as_deref().unwrap_or_default())]
     ErrorStatus { status: u16, text: Option<String> },
 }
 
@@ -55,8 +55,13 @@ impl Error {
     }
 
     #[must_use]
-    pub fn is_404(&self) -> bool {
+    pub fn is_not_found(&self) -> bool {
         matches!(self, Self::ErrorStatus { status: 404, .. })
+    }
+
+    #[must_use]
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::ErrorStatus { status: 409, .. })
     }
 }
 
