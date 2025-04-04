@@ -36,7 +36,7 @@ base64 = "0.22.1"
 # parsing
 quick-xml = { version = "0.37.2", features = ["serde", "serialize"] }
 serde = { version = "1.0.217", features = ["derive"] }
-crowd = { version = "0.1.0", path = "../crowd" }
+crowd = { version = "0.1.0", git = "https://github.com/ModProg/crowd.git" }
 # bin
 anyhow = { version = "1.0.95", optional = true }
 clap = { version = "4.5.32", features = ["derive", "env", "wrap_help", "unstable-markdown"], optional = true }
