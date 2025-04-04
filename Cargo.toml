@@ -81,6 +81,26 @@ bin = [
 # reqwest_async example
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread"] }
 
+[[example]]
+name = "minreq"
+required-features = ["minreq"]
+
+[[example]]
+name = "attohttpc"
+required-features = ["attohttpc"]
+
+[[example]]
+name = "reqwest_async"
+required-features = ["reqwest_async"]
+
+[[example]]
+name = "reqwest_blocking"
+required-features = ["reqwest_blocking"]
+
+[[example]]
+name = "ureq"
+required-features = ["ureq"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

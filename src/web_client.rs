@@ -1,5 +1,3 @@
-use std::future::ready;
-
 #[cfg(all(feature = "batteries", feature = "attohttpc"))]
 pub use attohttpc;
 #[cfg(feature = "async")]
@@ -113,7 +111,7 @@ impl Asyncness for Async {
     type Future<T: 'static> = BoxFuture<T>;
 
     fn ready<T: Send + 'static>(value: T) -> Self::Future<T> {
-        ready(value).boxed()
+        std::future::ready(value).boxed()
     }
 
     fn map<T: 'static, O: 'static>(
