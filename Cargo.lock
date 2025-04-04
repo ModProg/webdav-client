@@ -273,6 +273,7 @@ dependencies = [
 [[package]]
 name = "crowd"
 version = "0.1.0"
+source = "git+https://github.com/ModProg/crowd.git#cd4f35fb26b1cc889e8ba5cb96a4a3e14c506052"
 dependencies = [
  "serde",
 ]

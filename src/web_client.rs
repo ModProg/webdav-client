@@ -1,5 +1,4 @@
 use std::future::ready;
-use std::str::FromStr;
 
 #[cfg(all(feature = "batteries", feature = "attohttpc"))]
 pub use attohttpc;
@@ -174,10 +173,12 @@ impl Asyncness for Blocking {
 #[cfg(feature = "reqwest")]
 mod reqwest_impl {
 
+    use std::str::FromStr;
+
     use futures_util::{FutureExt, TryFutureExt};
     use reqwest::{Client, RequestBuilder, Response};
 
-    use super::{Async, BoxFuture, Error, FromStr, Result, WebClient};
+    use super::{Async, BoxFuture, Error, Result, WebClient};
 
     impl WebClient for Client {
         type Asyncness = Async;
@@ -228,9 +229,11 @@ mod reqwest_impl {
 #[cfg(feature = "reqwest-blocking")]
 mod reqwest_blocking_impl {
 
+    use std::str::FromStr;
+
     use reqwest::blocking::{Client, RequestBuilder, Response};
 
-    use super::{Blocking, Error, FromStr, Result, WebClient};
+    use super::{Blocking, Error, Result, WebClient};
 
     impl WebClient for Client {
         type Asyncness = Blocking;
